@@ -1244,7 +1244,17 @@ def _restore_gc_after_attempt():
 
 
 @torch.no_grad()
-def _generate_text(model, tokenizer, prompt, max_new_tokens, temperature, top_k, device, forbidden_token_ids=None):
+def _generate_text(
+    model,
+    tokenizer,
+    prompt,
+    max_new_tokens,
+    temperature,
+    top_k,
+    device,
+    forbidden_token_ids=None,
+    repetition_penalty=1.0,
+):
     model.eval()
     bos_token_id = tokenizer.get_bos_token_id()
     prompt_ids = tokenizer.encode(prompt) if prompt else []
@@ -1257,6 +1267,16 @@ def _generate_text(model, tokenizer, prompt, max_new_tokens, temperature, top_k,
         logits = logits[:, -1, :]
         if forbidden_token_ids:
             logits[:, list(forbidden_token_ids)] = float("-inf")
+        if repetition_penalty > 1.0:
+            for batch_idx in range(idx.size(0)):
+                seen_tokens = torch.unique(idx[batch_idx])
+                seen_logits = logits[batch_idx, seen_tokens]
+                adjusted_logits = torch.where(
+                    seen_logits > 0,
+                    seen_logits / repetition_penalty,
+                    seen_logits * repetition_penalty,
+                )
+                logits[batch_idx, seen_tokens] = adjusted_logits
         if top_k is not None and 0 < top_k < logits.size(-1):
             values, _ = torch.topk(logits, top_k)
             cutoff = values[:, [-1]]
@@ -1340,6 +1360,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128, help="Number of tokens to sample with --generate-only.")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for --generate-only.")
     parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling for --generate-only (0 disables).")
+    parser.add_argument("--repetition-penalty", type=float, default=1.1, help="Penalty >1 discourages repeating seen tokens during generation.")
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1377,6 +1398,7 @@ def main():
             top_k=None if args.top_k <= 0 else args.top_k,
             device=runtime.device,
             forbidden_token_ids=forbidden_token_ids,
+            repetition_penalty=args.repetition_penalty,
         )
         print("---")
         print(f"prompt: {args.prompt}")
