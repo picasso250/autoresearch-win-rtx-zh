@@ -3,3 +3,4 @@ a75721d	1.052423	5.3	keep	baseline chinese 10m tinystorieszh
 89e0896	1.042704	5.3	keep	slower lr decay for 10m budget
 8e6ed71	1.064424	5.3	keep	resume seed rerun with current best config
 e29a088	0.824672	5.3	keep	reduce decay for resumed run
+ee47a3f	0.714781	5.3	keep	lower embedding lr for resumed run
