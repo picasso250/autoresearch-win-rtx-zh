@@ -25,6 +25,7 @@ from prepare import (
     DATASET_CHOICES,
     EVAL_TOKENS,
     MAX_SEQ_LEN,
+    SPECIAL_TOKENS,
     TIME_BUDGET,
     Tokenizer,
     evaluate_bpb,
@@ -1214,10 +1215,77 @@ def _restore_gc_after_attempt():
     gc.collect()
 
 
+@torch.no_grad()
+def _generate_text(model, tokenizer, prompt, max_new_tokens, temperature, top_k, device, forbidden_token_ids=None):
+    model.eval()
+    bos_token_id = tokenizer.get_bos_token_id()
+    prompt_ids = tokenizer.encode(prompt) if prompt else []
+    idx = torch.tensor([[bos_token_id] + prompt_ids], dtype=torch.long, device=device)
+    forbidden_token_ids = forbidden_token_ids or ()
+
+    for _ in range(max_new_tokens):
+        x = idx[:, -MAX_SEQ_LEN:]
+        logits = model(x)
+        logits = logits[:, -1, :]
+        if forbidden_token_ids:
+            logits[:, list(forbidden_token_ids)] = float("-inf")
+        if top_k is not None and 0 < top_k < logits.size(-1):
+            values, _ = torch.topk(logits, top_k)
+            cutoff = values[:, [-1]]
+            logits = logits.masked_fill(logits < cutoff, float("-inf"))
+        if temperature <= 0:
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            probs = F.softmax(logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_token], dim=1)
+
+    generated_ids = idx[0].tolist()[1:]
+    return tokenizer.decode(generated_ids)
+
+
+def _infer_config_from_state_dict(state_dict, runtime, vocab_size):
+    layer_ids = sorted(
+        {
+            int(key.split(".")[2])
+            for key in state_dict
+            if key.startswith("transformer.h.") and key.endswith("attn.c_q.weight")
+        }
+    )
+    if not layer_ids:
+        raise RuntimeError("Could not infer layer count from checkpoint.")
+    n_layer = max(layer_ids) + 1
+    n_embd = state_dict["transformer.wte.weight"].shape[1]
+    n_head = None
+    for key, value in state_dict.items():
+        if key.startswith("transformer.h.") and key.endswith("attn.ve_gate.weight"):
+            n_head = value.shape[0]
+            break
+    if n_head is None:
+        raise RuntimeError("Could not infer head count from checkpoint.")
+    return GPTConfig(
+        sequence_len=MAX_SEQ_LEN,
+        vocab_size=vocab_size,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_kv_head=n_head,
+        n_embd=n_embd,
+        window_pattern=WINDOW_PATTERN,
+        attention_backend=runtime.attention_backend,
+        use_activation_checkpointing=runtime.use_activation_checkpointing,
+        compute_dtype=runtime.amp_dtype,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Optional dataset override.")
+    parser.add_argument("--generate-only", action="store_true", help="Load checkpoint_pre_eval.pt and sample text instead of training.")
+    parser.add_argument("--prompt", default="", help="Prompt text used with --generate-only.")
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="Number of tokens to sample with --generate-only.")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for --generate-only.")
+    parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling for --generate-only (0 disables).")
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1233,6 +1301,33 @@ def main():
     vocab_size = tokenizer.get_vocab_size()
     print(f"Vocab size: {vocab_size:,}")
     print(f"Dataset: {tokenizer.dataset}")
+
+    if args.generate_only:
+        checkpoint_path = Path("checkpoint_pre_eval.pt")
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path.resolve()}")
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        config = _infer_config_from_state_dict(state_dict, runtime, vocab_size)
+        print(f"Generation config: {asdict(config)}")
+        model = GPT(config)
+        model.load_state_dict(state_dict)
+        model.to(runtime.device)
+        forbidden_token_ids = [tokenizer.enc.encode_single_token(name) for name in SPECIAL_TOKENS]
+        text = _generate_text(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=args.prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=None if args.top_k <= 0 else args.top_k,
+            device=runtime.device,
+            forbidden_token_ids=forbidden_token_ids,
+        )
+        print("---")
+        print(f"prompt: {args.prompt}")
+        print("generation:")
+        print(text)
+        return 0
 
     # Configure optimizer kernels/dtypes before autotune so probes match real training runtime.
     _configure_step_kernels(runtime)
