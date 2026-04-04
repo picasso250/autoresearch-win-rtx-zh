@@ -1051,7 +1051,7 @@ def _configure_step_kernels(runtime):
     USE_COMPILE = False
 
 
-def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
+def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test, resume_checkpoint=None):
     t_start = time.time()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -1083,6 +1083,22 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         matrix_lr=MATRIX_LR,
         weight_decay=WEIGHT_DECAY,
     )
+    resume_metadata = {}
+    if resume_checkpoint is not None:
+        state_payload = torch.load(resume_checkpoint, map_location="cpu")
+        state_dict = _extract_checkpoint_state_dict(state_payload)
+        resume_metadata = _extract_checkpoint_metadata(state_payload)
+        model.load_state_dict(state_dict)
+        optimizer_state = resume_metadata.get("optimizer_state_dict")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            _move_optimizer_state_to_device(optimizer, runtime.device)
+        print(
+            "Resumed checkpoint: "
+            f"path={resume_checkpoint} "
+            f"step={resume_metadata.get('step', 0)} "
+            f"total_training_time={resume_metadata.get('total_training_time', 0.0):.1f}s"
+        )
     model = _maybe_compile(model, dynamic=False)
 
     train_loader = make_dataloader(
@@ -1117,8 +1133,9 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
 
     t_start_training = time.time()
     smooth_train_loss = 0.0
-    total_training_time = 0.0
-    step = 0
+    total_training_time = float(resume_metadata.get("total_training_time", 0.0))
+    segment_training_time = 0.0
+    step = int(resume_metadata.get("step", 0))
 
     while True:
         torch.cuda.synchronize()
@@ -1131,7 +1148,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             loss.backward()
             x, y, epoch = next(train_loader)
 
-        progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
+        progress = min(segment_training_time / max(target_training_seconds, 1e-6), 1.0)
         lrm = get_lr_multiplier(progress)
         muon_momentum = get_muon_momentum(step)
         muon_weight_decay = get_weight_decay(progress)
@@ -1152,6 +1169,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         dt = t1 - t0
         if step > 10:
             total_training_time += dt
+            segment_training_time += dt
 
         ema_beta = 0.9
         smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
@@ -1163,7 +1181,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             mfu_text = f"{mfu:.1f}%"
         else:
             mfu_text = "n/a"
-        remaining = max(0, target_training_seconds - total_training_time)
+        remaining = max(0, target_training_seconds - segment_training_time)
         print(
             f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
             f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
@@ -1182,9 +1200,9 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         step += 1
         if max_steps is not None and step >= max_steps:
             break
-        if step > 10 and total_training_time >= target_training_seconds:
+        if step > 10 and segment_training_time >= target_training_seconds:
             break
-        if smoke_test and total_training_time >= target_training_seconds:
+        if smoke_test and segment_training_time >= target_training_seconds:
             break
 
     print()
@@ -1193,16 +1211,26 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         "num_params": num_params,
         "num_flops_per_token": num_flops_per_token,
         "total_training_time": total_training_time,
+        "segment_training_time": segment_training_time,
         "step": step,
         "t_start": t_start,
         "t_start_training": t_start_training,
+        "optimizer": optimizer,
     }
 
 
-def _save_pre_eval_checkpoint(model):
+def _save_pre_eval_checkpoint(model, optimizer, config, tokenizer, step, total_training_time):
     try:
         state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
-        torch.save(state_dict, "checkpoint_pre_eval.pt")
+        payload = {
+            "model_state_dict": state_dict,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": asdict(config),
+            "dataset": tokenizer.dataset,
+            "step": step,
+            "total_training_time": total_training_time,
+        }
+        torch.save(payload, "checkpoint_pre_eval.pt")
         print("Saved checkpoint_pre_eval.pt")
     except Exception as exc:  # pragma: no cover
         print(f"Warning: could not save pre-eval checkpoint: {exc}")
@@ -1277,11 +1305,37 @@ def _infer_config_from_state_dict(state_dict, runtime, vocab_size):
     )
 
 
+def _extract_checkpoint_state_dict(payload):
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"]
+    return payload
+
+
+def _extract_checkpoint_metadata(payload):
+    if not isinstance(payload, dict) or "model_state_dict" not in payload:
+        return {}
+    return {
+        "optimizer_state_dict": payload.get("optimizer_state_dict"),
+        "config": payload.get("config"),
+        "step": int(payload.get("step", 0)),
+        "total_training_time": float(payload.get("total_training_time", 0.0)),
+        "dataset": payload.get("dataset"),
+    }
+
+
+def _move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Optional dataset override.")
     parser.add_argument("--generate-only", action="store_true", help="Load checkpoint_pre_eval.pt and sample text instead of training.")
+    parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint_pre_eval.pt.")
     parser.add_argument("--prompt", default="", help="Prompt text used with --generate-only.")
     parser.add_argument("--max-new-tokens", type=int, default=128, help="Number of tokens to sample with --generate-only.")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for --generate-only.")
@@ -1306,7 +1360,8 @@ def main():
         checkpoint_path = Path("checkpoint_pre_eval.pt")
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path.resolve()}")
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        state_payload = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = _extract_checkpoint_state_dict(state_payload)
         config = _infer_config_from_state_dict(state_dict, runtime, vocab_size)
         print(f"Generation config: {asdict(config)}")
         model = GPT(config)
@@ -1342,6 +1397,9 @@ def main():
     result = None
     chosen_train_batch = None
     chosen_checkpointing = None
+    resume_checkpoint = Path("checkpoint_pre_eval.pt") if args.resume else None
+    if args.resume and not resume_checkpoint.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found at {resume_checkpoint.resolve()}")
     for train_batch_size, use_checkpointing in train_candidates:
         config = build_model_config(
             DEPTH,
@@ -1362,6 +1420,7 @@ def main():
                 config=config,
                 device_batch_size=train_batch_size,
                 smoke_test=args.smoke_test,
+                resume_checkpoint=resume_checkpoint,
             )
             chosen_train_batch = train_batch_size
             chosen_checkpointing = use_checkpointing
@@ -1384,7 +1443,14 @@ def main():
         return 1
 
     model = result["model"]
-    _save_pre_eval_checkpoint(model)
+    _save_pre_eval_checkpoint(
+        model,
+        result["optimizer"],
+        config,
+        tokenizer,
+        result["step"],
+        result["total_training_time"],
+    )
     model.eval()
 
     eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
@@ -1417,7 +1483,7 @@ def main():
 
     t_end = time.time()
     step = result["step"]
-    total_training_time = result["total_training_time"]
+    total_training_time = result["segment_training_time"]
     num_flops_per_token = result["num_flops_per_token"]
     num_params = result["num_params"]
     steady_state_steps = max(step - 10, 0)
