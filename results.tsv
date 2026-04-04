@@ -6,3 +6,4 @@ e29a088	0.824672	5.3	keep	reduce decay for resumed run
 ee47a3f	0.714781	5.3	keep	lower embedding lr for resumed run
 88106c0	0.681144	5.3	keep	lower unembedding lr for resumed run
 c2c4fcd	0.670416	5.3	keep	lower matrix lr for resumed run
+802767a	0.669213	5.3	keep	lower scalar lr for resumed run
