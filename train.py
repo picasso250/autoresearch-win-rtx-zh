@@ -1350,6 +1350,16 @@ def _move_optimizer_state_to_device(optimizer, device):
                 state[key] = value.to(device)
 
 
+def _save_named_checkpoint_copy(target_name):
+    source = Path("checkpoint_pre_eval.pt")
+    if not source.exists():
+        return None
+    target = Path(target_name)
+    target.write_bytes(source.read_bytes())
+    print(f"Saved {target.name}")
+    return target
+
+
 def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
@@ -1361,6 +1371,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature for --generate-only.")
     parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling for --generate-only (0 disables).")
     parser.add_argument("--repetition-penalty", type=float, default=1.1, help="Penalty >1 discourages repeating seen tokens during generation.")
+    parser.add_argument("--checkpoint-tag", default=None, help="Optional suffix used to save a copy like checkpoint_<tag>.pt after training.")
+    parser.add_argument("--save-best-checkpoint", action="store_true", help="Also copy checkpoint_pre_eval.pt to checkpoint_best.pt after training.")
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1473,6 +1485,10 @@ def main():
         result["step"],
         result["total_training_time"],
     )
+    if args.checkpoint_tag:
+        _save_named_checkpoint_copy(f"checkpoint_{args.checkpoint_tag}.pt")
+    if args.save_best_checkpoint:
+        _save_named_checkpoint_copy("checkpoint_best.pt")
     model.eval()
 
     eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
