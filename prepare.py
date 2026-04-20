@@ -28,7 +28,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048          # context length
-TIME_BUDGET = 300           # training time budget in seconds (5 minutes)
+TIME_BUDGET = 600           # training time budget in seconds (10 minutes)
 EVAL_TOKENS = 40 * 524288   # number of tokens for validation eval
 VOCAB_SIZE = 8192
 
@@ -43,7 +43,7 @@ BOS_TOKEN = "<|reserved_0|>"
 # ---------------------------------------------------------------------------
 
 DEFAULT_DATASET = "tinystories"
-DATASET_CHOICES = ("tinystories",)
+DATASET_CHOICES = ("tinystories", "tinystorieszh")
 
 
 def _default_cache_dir():
@@ -67,15 +67,58 @@ def _default_cache_dir():
 CACHE_DIR = _default_cache_dir()
 DATASETS_DIR = os.path.join(CACHE_DIR, "datasets")
 ACTIVE_DATASET_PATH = os.path.join(CACHE_DIR, "active_dataset.txt")
+TOKENIZER_PROGRESS_DOC_INTERVAL = 100_000
+_TOKENIZED_SPLIT_CACHE = {}
 
 DATASET_CONFIGS = {
     "tinystories": {
+        "layout": "single_parquet",
+        "column": "text",
         "filename": "tinystories_gpt4_clean.parquet",
         "url": "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/main/tinystories_gpt4_clean.parquet",
         "splits": {
             "test": (0, 10_000),
             "val": (10_000, 20_000),
             "train": (20_000, None),
+        },
+    },
+    "tinystorieszh": {
+        "layout": "split_parquet_files",
+        "column": "story",
+        "files": {
+            "train": [
+                {
+                    "filename": "train-00000-of-00005.parquet",
+                    "url": "https://huggingface.co/datasets/Gabrui/multilingual_TinyStories/resolve/main/chinese/train-00000-of-00005.parquet",
+                },
+                {
+                    "filename": "train-00001-of-00005.parquet",
+                    "url": "https://huggingface.co/datasets/Gabrui/multilingual_TinyStories/resolve/main/chinese/train-00001-of-00005.parquet",
+                },
+                {
+                    "filename": "train-00002-of-00005.parquet",
+                    "url": "https://huggingface.co/datasets/Gabrui/multilingual_TinyStories/resolve/main/chinese/train-00002-of-00005.parquet",
+                },
+                {
+                    "filename": "train-00003-of-00005.parquet",
+                    "url": "https://huggingface.co/datasets/Gabrui/multilingual_TinyStories/resolve/main/chinese/train-00003-of-00005.parquet",
+                },
+                {
+                    "filename": "train-00004-of-00005.parquet",
+                    "url": "https://huggingface.co/datasets/Gabrui/multilingual_TinyStories/resolve/main/chinese/train-00004-of-00005.parquet",
+                },
+            ],
+            "test": [
+                {
+                    "filename": "test-00000-of-00001.parquet",
+                    "url": "https://huggingface.co/datasets/Gabrui/multilingual_TinyStories/resolve/main/chinese/test-00000-of-00001.parquet",
+                },
+            ],
+        },
+        "splits": {
+            "train": ("train", 0, None),
+            "val": ("test", 0, 10_000),
+            "test": ("test", 10_000, 20_000),
         },
     },
 }
@@ -149,6 +192,29 @@ def _tiny_parquet_path(dataset_name=None):
     return os.path.join(_data_dir(dataset), config["filename"])
 
 
+def _dataset_file_entries(dataset_name=None, split_name=None):
+    dataset = _resolve_dataset_name(dataset_name)
+    config = DATASET_CONFIGS[dataset]
+    file_groups = config.get("files")
+    if not file_groups:
+        return []
+    if split_name is None:
+        entries = []
+        for group_entries in file_groups.values():
+            entries.extend(group_entries)
+        return entries
+    return list(file_groups.get(split_name, ()))
+
+
+def _dataset_file_paths(dataset_name=None, split_name=None):
+    dataset = _resolve_dataset_name(dataset_name)
+    data_dir = _data_dir(dataset)
+    return [
+        os.path.join(data_dir, entry["filename"])
+        for entry in _dataset_file_entries(dataset, split_name)
+    ]
+
+
 def _tiny_legacy_parquet_paths(dataset_name=None):
     dataset = _resolve_dataset_name(dataset_name)
     data_dir = _data_dir(dataset)
@@ -215,9 +281,44 @@ def _download_tinystories_file(dataset_name):
     print(f"Data: downloaded {filename} to {filepath}")
 
 
+def _print_progress(message):
+    print(message, flush=True)
+
+
+def _download_split_parquet_files(dataset_name):
+    dataset = _resolve_dataset_name(dataset_name)
+    data_dir = _data_dir(dataset)
+    os.makedirs(data_dir, exist_ok=True)
+
+    for split_name in ("train", "test"):
+        for entry in _dataset_file_entries(dataset, split_name):
+            filepath = os.path.join(data_dir, entry["filename"])
+            if os.path.exists(filepath):
+                _print_progress(f"Data: {entry['filename']} already downloaded at {filepath}")
+                continue
+
+            _print_progress(f"Data: downloading {entry['filename']}...")
+            response = requests.get(entry["url"], stream=True, timeout=60)
+            response.raise_for_status()
+            temp_path = filepath + ".tmp"
+            with open(temp_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            os.rename(temp_path, filepath)
+            _print_progress(f"Data: downloaded {entry['filename']} to {filepath}")
+
+
 def download_data(dataset_name):
     dataset = _resolve_dataset_name(dataset_name)
-    _download_tinystories_file(dataset)
+    layout = DATASET_CONFIGS[dataset]["layout"]
+    if layout == "single_parquet":
+        _download_tinystories_file(dataset)
+        return
+    if layout == "split_parquet_files":
+        _download_split_parquet_files(dataset)
+        return
+    raise ValueError(f"Unsupported dataset layout for {dataset!r}: {layout}")
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +329,13 @@ def list_parquet_files(dataset_name=None):
     dataset = _resolve_dataset_name(dataset_name)
     data_dir = _data_dir(dataset)
     files = []
+    config = DATASET_CONFIGS[dataset]
+    if config["layout"] == "split_parquet_files":
+        expected = _dataset_file_paths(dataset)
+        existing = [path for path in expected if os.path.exists(path)]
+        if existing:
+            return existing
+        return []
     if os.path.exists(data_dir):
         files = sorted(
             name for name in os.listdir(data_dir)
@@ -242,43 +350,77 @@ def list_parquet_files(dataset_name=None):
     return []
 
 
-def _iter_tinystories_texts(split, dataset_name=None):
+def _iter_dataset_texts(split, dataset_name=None):
     dataset = _resolve_dataset_name(dataset_name)
     config = DATASET_CONFIGS[dataset]
-    start_idx, end_idx = config["splits"][split]
-    tiny_path = _resolve_tiny_parquet_for_read(dataset)
+    column = config["column"]
+    split_spec = config["splits"][split]
+    layout = config["layout"]
 
-    if not os.path.exists(tiny_path):
-        raise FileNotFoundError(
-            f"TinyStories parquet not found at {tiny_path}. Run prepare.py first."
-        )
+    if layout == "single_parquet":
+        start_idx, end_idx = split_spec
+        parquet_paths = [_resolve_tiny_parquet_for_read(dataset)]
+    elif layout == "split_parquet_files":
+        source_split, start_idx, end_idx = split_spec
+        parquet_paths = _dataset_file_paths(dataset, source_split)
+    else:
+        raise ValueError(f"Unsupported dataset layout for {dataset!r}: {layout}")
+
+    if not parquet_paths:
+        raise FileNotFoundError(f"No parquet files found for dataset {dataset!r}. Run prepare.py first.")
 
     current_idx = 0
-    parquet_file = pq.ParquetFile(tiny_path)
-    for row_group_idx in range(parquet_file.num_row_groups):
-        row_group = parquet_file.read_row_group(row_group_idx, columns=["text"])
-        texts = row_group.column("text").to_pylist()
-        for text in texts:
-            if current_idx < start_idx:
+    for parquet_path in parquet_paths:
+        if not os.path.exists(parquet_path):
+            raise FileNotFoundError(f"Dataset parquet not found at {parquet_path}. Run prepare.py first.")
+        _print_progress(f"Data: reading {split} source file {parquet_path}")
+        parquet_file = pq.ParquetFile(parquet_path)
+        for row_group_idx in range(parquet_file.num_row_groups):
+            row_group = parquet_file.read_row_group(row_group_idx, columns=[column])
+            texts = row_group.column(column).to_pylist()
+            for text in texts:
+                if current_idx < start_idx:
+                    current_idx += 1
+                    continue
+                if end_idx is not None and current_idx >= end_idx:
+                    return
+                yield text
                 current_idx += 1
-                continue
-            if end_idx is not None and current_idx >= end_idx:
-                return
-            yield text
-            current_idx += 1
 
 
-def text_iterator(dataset_name=None, max_chars=1_000_000_000, doc_cap=10_000):
+def text_iterator(dataset_name=None, max_chars=1_000_000_000, doc_cap=10_000, progress_interval_docs=TOKENIZER_PROGRESS_DOC_INTERVAL):
     dataset = _resolve_dataset_name(dataset_name)
     chars = 0
+    docs = 0
+    t0 = time.time()
 
-    text_iter = _iter_tinystories_texts("train", dataset_name=dataset)
+    text_iter = _iter_dataset_texts("train", dataset_name=dataset)
     for text in text_iter:
         doc = text[:doc_cap] if len(text) > doc_cap else text
         chars += len(doc)
+        docs += 1
+        if progress_interval_docs and docs % progress_interval_docs == 0:
+            dt = max(time.time() - t0, 1e-6)
+            _print_progress(
+                "Tokenizer: "
+                f"dataset={dataset} docs={docs:,} chars={chars:,} "
+                f"elapsed={dt:.1f}s docs_per_s={docs / dt:,.0f} chars_per_s={chars / dt:,.0f}"
+            )
         yield doc
         if chars >= max_chars:
+            dt = max(time.time() - t0, 1e-6)
+            _print_progress(
+                "Tokenizer: "
+                f"dataset={dataset} hit max_chars={max_chars:,} after docs={docs:,} "
+                f"elapsed={dt:.1f}s"
+            )
             return
+    dt = max(time.time() - t0, 1e-6)
+    _print_progress(
+        "Tokenizer: "
+        f"dataset={dataset} exhausted training texts at docs={docs:,} chars={chars:,} "
+        f"elapsed={dt:.1f}s"
+    )
 
 
 def train_tokenizer(dataset_name=None):
@@ -296,9 +438,12 @@ def train_tokenizer(dataset_name=None):
     parquet_files = list_parquet_files(dataset)
     if len(parquet_files) < 1:
         print("Tokenizer: TinyStories parquet is missing. Run prepare.py first.")
-        raise RuntimeError("TinyStories parquet is missing.")
+        raise RuntimeError(f"Dataset parquet is missing for {dataset}.")
 
-    print(f"Tokenizer: training BPE tokenizer ({dataset})...")
+    _print_progress(f"Tokenizer: training BPE tokenizer ({dataset})...")
+    _print_progress(f"Tokenizer: parquet files={len(parquet_files)}")
+    for path in parquet_files:
+        _print_progress(f"Tokenizer: source file {path}")
     t0 = time.time()
     tokenizer = rustbpe.Tokenizer()
     vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
@@ -323,9 +468,9 @@ def train_tokenizer(dataset_name=None):
         pickle.dump(enc, f)
 
     t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    _print_progress(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
 
-    print("Tokenizer: building token_bytes lookup...")
+    _print_progress("Tokenizer: building token_bytes lookup...")
     special_set = set(SPECIAL_TOKENS)
     token_bytes_list = []
     for token_id in range(enc.n_vocab):
@@ -336,7 +481,7 @@ def train_tokenizer(dataset_name=None):
             token_bytes_list.append(len(token_str.encode("utf-8")))
     token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
     torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    _print_progress(f"Tokenizer: saved token_bytes to {token_bytes_path}")
 
     with open(os.path.join(tokenizer_dir, "dataset.txt"), "w", encoding="utf-8") as f:
         f.write(dataset + "\n")
@@ -345,7 +490,7 @@ def train_tokenizer(dataset_name=None):
     encoded = enc.encode_ordinary(test)
     decoded = enc.decode(encoded)
     assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    _print_progress(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 
 # ---------------------------------------------------------------------------
@@ -405,10 +550,19 @@ def _document_batches(split, dataset=None, tokenizer_batch_size=128):
     dataset_name = _resolve_dataset_name(dataset)
     assert split in ("train", "val", "test")
 
+    cache_key = (dataset_name, split)
+    cached_docs = _TOKENIZED_SPLIT_CACHE.get(cache_key)
+    if cached_docs is not None:
+        epoch = 1
+        while True:
+            for start_idx in range(0, len(cached_docs), tokenizer_batch_size):
+                yield cached_docs[start_idx:start_idx + tokenizer_batch_size], epoch
+            epoch += 1
+
     epoch = 1
     while True:
         batch = []
-        for text in _iter_tinystories_texts(split, dataset_name=dataset_name):
+        for text in _iter_dataset_texts(split, dataset_name=dataset_name):
             batch.append(text)
             if len(batch) >= tokenizer_batch_size:
                 yield batch, epoch
@@ -416,6 +570,27 @@ def _document_batches(split, dataset=None, tokenizer_batch_size=128):
         if batch:
             yield batch, epoch
         epoch += 1
+
+
+def _get_tokenized_eval_docs(tokenizer, split, dataset_name, tokenizer_batch_size=128):
+    cache_key = (dataset_name, split)
+    cached_docs = _TOKENIZED_SPLIT_CACHE.get(cache_key)
+    if cached_docs is not None:
+        return cached_docs
+
+    _print_progress(f"Data: caching tokenized {split} split for dataset={dataset_name}")
+    tokenized_docs = []
+    doc_batches = _document_batches(split, dataset=dataset_name, tokenizer_batch_size=tokenizer_batch_size)
+    while True:
+        batch, epoch = next(doc_batches)
+        if epoch != 1:
+            break
+        tokenized_docs.extend(tokenizer.encode(batch, prepend=tokenizer.get_bos_token_id()))
+    _TOKENIZED_SPLIT_CACHE[cache_key] = tokenized_docs
+    _print_progress(
+        f"Data: cached {len(tokenized_docs):,} tokenized docs for {dataset_name}/{split}"
+    )
+    return tokenized_docs
 
 
 def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_size=1000):
@@ -431,15 +606,33 @@ def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_
     assert split in ("train", "val", "test")
 
     row_capacity = T + 1
-    batches = _document_batches(split, dataset=dataset_name)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     epoch = 1
     resolved_device = torch.device(device)
     use_cuda = resolved_device.type == "cuda"
 
+    cached_tokenized_docs = None
+    cached_doc_index = 0
+    if split != "train":
+        cached_tokenized_docs = _get_tokenized_eval_docs(tokenizer, split, dataset_name)
+    else:
+        batches = _document_batches(split, dataset=dataset_name)
+
     def refill_buffer():
-        nonlocal epoch
+        nonlocal epoch, cached_doc_index
+        if cached_tokenized_docs is not None:
+            if not cached_tokenized_docs:
+                raise RuntimeError(f"No tokenized docs available for {dataset_name}/{split}.")
+            start_idx = cached_doc_index
+            end_idx = min(start_idx + 128, len(cached_tokenized_docs))
+            doc_buffer.extend(cached_tokenized_docs[start_idx:end_idx])
+            cached_doc_index = end_idx
+            if cached_doc_index >= len(cached_tokenized_docs):
+                cached_doc_index = 0
+                epoch += 1
+            return
+
         doc_batch, epoch = next(batches)
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
